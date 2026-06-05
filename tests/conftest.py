@@ -166,8 +166,122 @@ def _format_report_sections(sections: Iterable[tuple[str, str]]) -> list[str]:
     return formatted
 
 
+def _dump_async_tasks_to(out) -> None:
+    """Write the stacks of all pending asyncio tasks to *out* (a text stream).
+
+    Collects ``asyncio.Task`` objects across every event loop via ``gc`` (so the
+    per-call loop in chat_executor and all background loops are covered, without
+    needing a loop reference) and prints each pending task's suspended stack --
+    the frame that reveals the exact ``await`` a hang is stuck on.
+    """
+    import asyncio
+    import gc
+
+    try:
+        objects = gc.get_objects()
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        out.write(f"<failed to enumerate objects: {exc}>\n")
+        return
+
+    # Guard every membership test individually: scanning the whole heap can touch
+    # lazy proxy objects whose introspection raises (e.g. the Anthropic vertex
+    # shim imports ``google-auth`` on attribute access). A single bad object must
+    # not abort the entire dump.
+    tasks = []
+    for obj in objects:
+        try:
+            if isinstance(obj, asyncio.Task):
+                tasks.append(obj)
+        except Exception:
+            continue
+    pending = []
+    for task in tasks:
+        try:
+            if not task.done():
+                pending.append(task)
+        except Exception:  # pragma: no cover - diagnostics only
+            continue
+    out.write(f"{len(pending)} pending / {len(tasks)} total asyncio task(s)\n")
+    for index, task in enumerate(pending):
+        try:
+            out.write(f"\n--- asyncio task #{index}: {task!r} ---\n")
+        except Exception:  # pragma: no cover - diagnostics only
+            out.write(f"\n--- asyncio task #{index}: <repr failed> ---\n")
+        try:
+            task.print_stack(file=out)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            out.write(f"  <print_stack failed: {exc}>\n")
+
+
+def _install_async_task_dumper() -> None:
+    """Make nightly hangs reveal asyncio task stacks, not just thread stacks.
+
+    Two entry points, both nightly-layer only and inert on normal runs:
+
+    * a ``SIGQUIT`` handler so ``kill -QUIT <pid>`` on the runner dumps thread
+      stacks plus every pending asyncio task's stack on demand; and
+    * a monkeypatch of ``pytest_timeout.dump_stacks`` so the same task stacks are
+      appended automatically whenever pytest-timeout fires -- both its ``signal``
+      and ``thread`` methods call ``dump_stacks`` right before failing/killing.
+
+    A thread-stack dump alone cannot tell a stalled network read apart from an
+    async deadlock (an ``await`` on a future that never resolves): both park the
+    loop in ``epoll_wait`` and the suspended coroutine is on no thread's stack.
+    The per-task stacks are the decisive evidence.
+    """
+    if os.getenv("DATUS_TEST_LAYER") != "nightly":
+        return
+
+    import signal
+
+    if hasattr(signal, "SIGQUIT"):  # POSIX only
+        import faulthandler
+
+        def _on_sigquit(signum, frame) -> None:  # noqa: ARG001 - handler signature
+            out = sys.stderr
+            try:
+                out.write("\n==== SIGQUIT: thread stacks ====\n")
+                faulthandler.dump_traceback(file=out, all_threads=True)
+                out.write("\n==== SIGQUIT: asyncio tasks ====\n")
+                _dump_async_tasks_to(out)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                out.write(f"<async task dump failed: {exc}>\n")
+            finally:
+                out.flush()
+
+        signal.signal(signal.SIGQUIT, _on_sigquit)
+
+    # Augment pytest-timeout's dump so the automatic timeout kill also prints
+    # asyncio tasks. timeout_sigalrm()/timeout_timer() both resolve dump_stacks
+    # as a module global at call time, so reassigning the attribute is enough.
+    try:
+        import io
+
+        import pytest_timeout
+    except Exception:  # pragma: no cover - plugin is always present in nightly
+        return
+
+    original_dump_stacks = getattr(pytest_timeout, "dump_stacks", None)
+    if original_dump_stacks is None or getattr(original_dump_stacks, "_datus_wrapped", False):
+        return
+
+    def _dump_stacks_with_tasks(terminal) -> None:
+        original_dump_stacks(terminal)
+        try:
+            buffer = io.StringIO()
+            _dump_async_tasks_to(buffer)
+            terminal.sep("~", title="asyncio tasks")
+            terminal.write(buffer.getvalue())
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            terminal.write(f"<async task dump failed: {exc}>\n")
+
+    _dump_stacks_with_tasks._datus_wrapped = True
+    pytest_timeout.dump_stacks = _dump_stacks_with_tasks
+
+
 def pytest_configure(config) -> None:
     _DATUS_RERUN_REPORTS.clear()
+    _install_async_task_dumper()
 
 
 def pytest_runtest_logreport(report) -> None:
